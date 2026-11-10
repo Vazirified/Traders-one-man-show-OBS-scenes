@@ -1,0 +1,19 @@
+# Separate public repo (github.com/Vazirified/live-tickers). Never absorb it here.
+# OBS loads it over http://localhost:5000, so its location does not matter.
+Scripts/live-tickers-v.2.0/
+
+# Third-party plugin installers. Download sources are listed in README.
+Extensions/
+
+# YouTube Audio Library tracks: licensed for use in our videos/streams,
+# not for redistribution as files. Titles and artists are listed in README.
+VazirifiedFX-dual-output-scene/resources/live-session-music/
+*.mp3
+*.wav
+
+# OBS auto-backups (git history replaces them)
+*.bak
+
+# Windows clutter
+Thumbs.db
+desktop.ini

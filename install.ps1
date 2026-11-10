@@ -17,6 +17,11 @@
       - The Aitum Vertical (vertical canvas) settings.
       - The IRZar font, for the current user only (no admin needed).
       - The VDO.Ninja stream ID, plus the git filter that keeps it out of commits.
+      - The live tickers (github.com/Vazirified/live-tickers, a separate repo):
+        Python 3.14.2 for the current user if missing (no admin needed), a
+        clone pinned to tag v2.0.0 in Scripts\live-tickers-v.2.0, and its
+        setup.bat. An existing tickers folder is left alone. MetaTrader 5 is
+        not installed (it needs your broker login); you are told if it's missing.
 
     Safe to run again: files that are already up to date are left alone. If an
     installed file has different content, the script stops unless -Force is
@@ -39,6 +44,9 @@
 .PARAMETER SkipDependencies
     Do not check or install OBS, VLC and the plugins.
 
+.PARAMETER SkipTickers
+    Do not set up the live tickers (or Python).
+
 .PARAMETER DownloadOnly
     Only download and check all pinned installers into .\installers (for an
     offline copy), then stop. Installs nothing.
@@ -60,6 +68,7 @@ param(
     [switch]$Force,
     [switch]$SkipFont,
     [switch]$SkipDependencies,
+    [switch]$SkipTickers,
     [switch]$DownloadOnly,
     [switch]$DependenciesOnly
 )
@@ -112,6 +121,19 @@ $Dependencies = @(
        Url  = 'https://github.com/norihiro/obs-face-tracker/releases/download/0.9.0/obs-face-tracker-0.9.0-obs30-Windows-Installer.exe'
        Sha256 = 'cd344c60f2df8c9e6af98a2821cf52f7ed1b25221c25f20b889d53b2bb1864f6'; Args = $InnoSilent }
 )
+
+# Live tickers: their own repo, cloned next to the other scripts. OBS loads them
+# from http://localhost:5000 (started by the tickers' run.bat), not from disk.
+$TickersUrl = 'https://github.com/Vazirified/live-tickers.git'
+$TickersTag = 'v2.0.0'
+$TickersDir = Join-Path $RepoRoot 'Scripts\live-tickers-v.2.0'
+
+# Python for the tickers' virtual environment. Installed for the current user
+# only, so it needs no admin rights.
+$Python = @{ Name = 'Python'; Version = '3.14.2'; Minor = '3.14'
+    Url    = 'https://www.python.org/ftp/python/3.14.2/python-3.14.2-amd64.exe'
+    Sha256 = '9db919cefe30a0051658c600a9912acb0cd2b872aaf35842c9ec2bf401efa848'
+    Args   = '/quiet InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1 Include_test=0' }
 
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $Utf8Bom   = New-Object System.Text.UTF8Encoding($true)
@@ -228,6 +250,24 @@ function Install-Dependency($Dep) {
     Write-Ok "$($Dep.Name) $($Dep.Version) installed."
 }
 
+# Finds Python <Minor> through the registry entries every Python installer writes
+# (PEP 514). Returns @{ Exe; Version } or $null.
+function Find-Python([string]$Minor) {
+    foreach ($root in 'HKCU:\Software\Python\PythonCore', 'HKLM:\Software\Python\PythonCore') {
+        $key = "$root\$Minor\InstallPath"
+        if (-not (Test-Path $key)) { continue }
+        $props = Get-ItemProperty $key
+        $exe = if ($props.PSObject.Properties['ExecutablePath']) { $props.ExecutablePath }
+               elseif ($props.PSObject.Properties['(default)']) { Join-Path $props.'(default)' 'python.exe' }
+               else { $null }
+        if ($exe -and (Test-Path -LiteralPath $exe)) {
+            $version = (& $exe -c 'import platform; print(platform.python_version())').Trim()
+            return @{ Exe = $exe; Version = $version }
+        }
+    }
+    return $null
+}
+
 function Test-Admin {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -236,7 +276,7 @@ function Test-Admin {
 # --- Download-only mode -----------------------------------------------------
 if ($DownloadOnly) {
     Write-Step "Downloading pinned installers into $InstallerDir"
-    foreach ($d in $Dependencies) { Save-Installer $d | Out-Null }
+    foreach ($d in $Dependencies + $Python) { Save-Installer $d | Out-Null }
     Write-Host ''
     Write-Host 'Done. Nothing was installed.' -ForegroundColor Cyan
     exit 0
@@ -425,7 +465,85 @@ if ($SkipFont) {
     }
 }
 
-# --- 7. Files the scene uses that are not in the repo -----------------------
+# --- 7. Live tickers --------------------------------------------------------
+Write-Step 'Live tickers'
+
+if ($SkipTickers) {
+    Write-Note 'Skipped (-SkipTickers).'
+} else {
+    $tickersVenv = Join-Path $TickersDir '.venv\Scripts\python.exe'
+    $tickersRel  = $TickersDir.Substring($RepoRoot.Length + 1)
+
+    # Clone, unless a tickers folder is already there (never touch a working copy).
+    if (Test-Path -LiteralPath $TickersDir) {
+        $describe = if (Test-Path -LiteralPath (Join-Path $TickersDir '.git')) {
+            $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            try { (& git -C $TickersDir describe --tags --always --dirty 2>$null) } finally { $ErrorActionPreference = $prev }
+        } else { 'not a git repo' }
+        Write-Ok "$tickersRel already present ($describe). Left as is."
+    } else {
+        if (-not $haveGit) { throw 'git is needed to download the live tickers. Install Git for Windows, or use -SkipTickers.' }
+        Write-Host "    Cloning $TickersUrl at $TickersTag..."
+        Invoke-Git -c advice.detachedHead=false clone --quiet --branch $TickersTag $TickersUrl $tickersRel | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $TickersDir 'setup.bat'))) {
+            throw "Could not clone the live tickers from $TickersUrl (exit code $LASTEXITCODE)."
+        }
+        Write-Ok "Cloned into $tickersRel at $TickersTag."
+    }
+
+    # Virtual environment, via the tickers' own setup.bat, unless it already exists.
+    if (Test-Path -LiteralPath $tickersVenv) {
+        Write-Ok 'Python environment already set up.'
+    } else {
+        $py = Find-Python $Python.Minor
+        if (-not $py) {
+            Write-Host "    Python $($Python.Version) not found, installing it for the current user..."
+            $file = Save-Installer $Python
+            $p = Start-Process -FilePath $file -ArgumentList $Python.Args -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "Python installer failed (exit code $($p.ExitCode))." }
+            $py = Find-Python $Python.Minor
+            if (-not $py) { throw "Python $($Python.Version) was installed but could not be found." }
+            Write-Ok "Python $($py.Version) installed."
+        } elseif ($py.Version -ne $Python.Version) {
+            Write-Note "Using Python $($py.Version) (this repo pins $($Python.Version))."
+        } else {
+            Write-Ok "Python $($py.Version) found."
+        }
+
+        # Put this Python first on PATH for setup.bat. The empty input answers its
+        # final 'pause'. '.\' because some PCs block running files from the current
+        # folder by bare name (NoDefaultCurrentDirectoryInExePath).
+        Write-Host '    Running the tickers'' setup.bat (creates .venv, installs packages)...'
+        $pyDir = Split-Path $py.Exe -Parent
+        $previousPath = $env:Path
+        $env:Path = "$pyDir;$pyDir\Scripts;$env:Path"
+        Push-Location -LiteralPath $TickersDir
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try     { '' | & cmd.exe /d /c .\setup.bat | ForEach-Object { "      $_" } | Write-Host }
+        finally { $ErrorActionPreference = $prev; Pop-Location; $env:Path = $previousPath }
+
+        # setup.bat always exits 0, so the import check below is what decides.
+        if (-not (Test-Path -LiteralPath $tickersVenv)) { throw 'setup.bat did not create the .venv folder.' }
+        Write-Ok 'Python environment created.'
+    }
+
+    # Health check, also for an existing environment. (No double quotes in the
+    # Python code: Windows PowerShell 5.1 strips them from native arguments.)
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try     { $check = & $tickersVenv -c "import sys, MetaTrader5, flask, flask_socketio; print('ok', sys.version.split()[0])" 2>&1 }
+    finally { $ErrorActionPreference = $prev }
+    if ("$check" -notmatch '^ok (\S+)$') { throw "The tickers' Python packages do not load: $check" }
+    Write-Ok "Tickers' packages load correctly (Python $($Matches[1]))."
+
+    if (@(Get-InstalledApp | Where-Object { $_.Name -match 'MetaTrader 5' }).Count -gt 0) {
+        Write-Ok 'MetaTrader 5 is installed.'
+    } else {
+        Write-Note 'MetaTrader 5 is not installed. The tickers read prices from it: install your broker''s MetaTrader 5 and log in.'
+    }
+    Write-Ok "Start the tickers with $tickersRel\run.bat before going live (OBS reads http://localhost:5000)."
+}
+
+# --- 8. Files the scene uses that are not in the repo -----------------------
 Write-Step 'Media check'
 
 $refs = [regex]::Matches($scene, '"(?:file|local_file|image_path|path|value)"\s*:\s*"(' + [regex]::Escape($newRoot) + '/[^"]+)"') |

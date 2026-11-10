@@ -6084,8 +6084,8 @@
             "name": "Background Only H"
         }
     ],
-    "current_scene": "Camera Only H",
-    "current_program_scene": "Camera Only H",
+    "current_scene": "Background Only H",
+    "current_program_scene": "Background Only H",
     "canvases": [
         {
             "info": {
@@ -6099,6 +6099,11 @@
     "current_transition": "Fade",
     "transition_duration": 1000,
     "transitions": [
+        {
+            "name": "Stinger",
+            "id": "obs_stinger_transition",
+            "settings": {}
+        },
         {
             "name": "Move",
             "id": "move_transition",
@@ -6116,11 +6121,6 @@
                 "curve_in": 0.0,
                 "curve_out": 0.0
             }
-        },
-        {
-            "name": "Stinger",
-            "id": "obs_stinger_transition",
-            "settings": {}
         }
     ],
     "quick_transitions": [

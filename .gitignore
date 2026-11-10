@@ -5,6 +5,9 @@ Scripts/live-tickers-v.2.0/
 # Third-party plugin installers. Download sources are listed in README.
 Extensions/
 
+# Installers downloaded by install.ps1 (pinned versions, SHA-256 checked)
+installers/
+
 # YouTube Audio Library tracks: licensed for use in our videos/streams,
 # not for redistribution as files. Titles and artists are listed in README.
 VazirifiedFX-dual-output-scene/resources/live-session-music/

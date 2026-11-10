@@ -4,6 +4,12 @@
 
 .DESCRIPTION
     Installs:
+      - OBS Studio, VLC and the OBS plugins this setup uses, each pinned to the
+        version it was built with. Each installer is downloaded from its official
+        source into .\installers, checked against a SHA-256 written in this
+        script, and run silently. Anything already installed is left alone,
+        even if its version differs. Installing needs admin rights, so Windows
+        asks once (UAC) when something is missing.
       - The scene collection, with every path rewritten to wherever this repo
         was cloned. The Lua scripts and their settings are part of the scene
         collection, so they are installed with it.
@@ -11,8 +17,6 @@
       - The Aitum Vertical (vertical canvas) settings.
       - The IRZar font, for the current user only (no admin needed).
       - The VDO.Ninja stream ID, plus the git filter that keeps it out of commits.
-
-    It does NOT install OBS or plugins yet.
 
     Safe to run again: files that are already up to date are left alone. If an
     installed file has different content, the script stops unless -Force is
@@ -32,17 +36,32 @@
 .PARAMETER SkipFont
     Do not install the font.
 
+.PARAMETER SkipDependencies
+    Do not check or install OBS, VLC and the plugins.
+
+.PARAMETER DownloadOnly
+    Only download and check all pinned installers into .\installers (for an
+    offline copy), then stop. Installs nothing.
+
+.PARAMETER DependenciesOnly
+    Used internally: the elevated (admin) run that installs missing dependencies.
+
 .EXAMPLE
     .\install.bat
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File install.ps1 -Force
+.EXAMPLE
+    .\install.bat -DownloadOnly
 #>
 [CmdletBinding()]
 param(
     [string]$ObsConfigDir = (Join-Path $env:APPDATA 'obs-studio'),
     [string]$VdoNinjaId,
     [switch]$Force,
-    [switch]$SkipFont
+    [switch]$SkipFont,
+    [switch]$SkipDependencies,
+    [switch]$DownloadOnly,
+    [switch]$DependenciesOnly
 )
 
 Set-StrictMode -Version 2
@@ -53,6 +72,7 @@ $ObsConfigDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFro
 trap {
     Write-Host ''
     Write-Host "STOPPED: $($_.Exception.Message)" -ForegroundColor Red
+    if ($DependenciesOnly) { Read-Host 'Press Enter to close this window' | Out-Null }
     exit 1
 }
 
@@ -64,6 +84,34 @@ $VerticalSrc     = Join-Path $RepoRoot 'VazirifiedFX-dual-output-scene\vertical-
 $FontSrc         = Join-Path $RepoRoot 'Fonts\IRZar.ttf'
 $SceneFileName   = 'Double_Output_Vazirified_Channels.json'
 $Placeholder     = '__VDO_NINJA_STREAM_ID__'
+$InstallerDir    = Join-Path $RepoRoot 'installers'
+
+# --- Pinned dependencies -----------------------------------------------------
+# Versions match the PC this setup was built on. To update one, change Version,
+# Url and Sha256 together (GitHub shows each release file's sha256 digest).
+# Match is a regex on the program's name in Windows "Installed apps"; installers
+# run in this order (OBS first, the plugin installers look for it).
+$InnoSilent = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'
+$Dependencies = @(
+    @{ Name = 'OBS Studio';          Version = '33.0.1'; Match = '^OBS Studio$'
+       Url  = 'https://github.com/obsproject/obs-studio/releases/download/33.0.1/OBS-Studio-33.0.1-Windows-x64-Installer.exe'
+       Sha256 = '37ecde4d9a28e8aeeb07623c8469b5d558eb264e02ccf435bb859891c401758b'; Args = '/S' }
+    @{ Name = 'VLC media player';    Version = '3.0.23'; Match = '^VLC media player$'
+       Url  = 'https://download.videolan.org/pub/videolan/vlc/3.0.23/win64/vlc-3.0.23-win64.exe'
+       Sha256 = '20ad191348684b470ddc4e05204316f3d8e39655f412b3e392a0eef97639daaf'; Args = '/S' }
+    @{ Name = 'DroidCam OBS plugin'; Version = '2.5.1';  Match = '^DroidCam OBS Plugin'
+       Url  = 'https://github.com/dev47apps/droidcam-obs-plugin/releases/download/2.5.1/DroidCamOBS.Setup.2.5.1.exe'
+       Sha256 = 'fb20d899cd2aa45b3670e7ee10a5e90130dc489321770dd271b701d82522db31'; Args = '/S' }
+    @{ Name = 'Move Transition';     Version = '3.2.1';  Match = '^move-transition version'
+       Url  = 'https://github.com/exeldro/obs-move-transition/releases/download/3.2.1/move-transition-3.2.1-windows-installer.exe'
+       Sha256 = 'a3777ac68c0e7c86dbab8ea94146dbf4a48223e128696c32defd99ddaa56f8c8'; Args = $InnoSilent }
+    @{ Name = 'Aitum Vertical';      Version = '1.6.1';  Match = '^vertical-canvas version'
+       Url  = 'https://github.com/Aitum/obs-vertical-canvas/releases/download/1.6.1/vertical-canvas-windows-installer.exe'
+       Sha256 = '455dc673290b7098a72b1c72705b86ad80118e2fefd149970f566ad64dd6ee6c'; Args = $InnoSilent }
+    @{ Name = 'Face Tracker';        Version = '0.9.0';  Match = '^obs-face-tracker version'
+       Url  = 'https://github.com/norihiro/obs-face-tracker/releases/download/0.9.0/obs-face-tracker-0.9.0-obs30-Windows-Installer.exe'
+       Sha256 = 'cd344c60f2df8c9e6af98a2821cf52f7ed1b25221c25f20b889d53b2bb1864f6'; Args = $InnoSilent }
+)
 
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $Utf8Bom   = New-Object System.Text.UTF8Encoding($true)
@@ -116,12 +164,101 @@ function Invoke-Git {
     return $output
 }
 
+# Programs in Windows "Installed apps" (64-bit, 32-bit and per-user).
+function Get-InstalledApp {
+    $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSObject.Properties['DisplayName'] } |
+        ForEach-Object {
+            $version = if ($_.PSObject.Properties['DisplayVersion']) { $_.DisplayVersion } else { '' }
+            [pscustomobject]@{ Name = $_.DisplayName; Version = $version }
+        }
+}
+
+# Returns the dependencies that are not installed at all, and reports the rest.
+function Get-MissingDependency([bool]$Quiet) {
+    $apps = @(Get-InstalledApp)
+    foreach ($d in $Dependencies) {
+        $hit = $apps | Where-Object { $_.Name -match $d.Match } | Select-Object -First 1
+        if (-not $hit) {
+            if (-not $Quiet) { Write-Note "$($d.Name) $($d.Version): not installed" }
+            $d
+        } elseif ($Quiet) {
+        } elseif ($hit.Version -eq $d.Version) {
+            Write-Ok "$($d.Name) $($d.Version) installed."
+        } else {
+            Write-Note "$($d.Name): $($hit.Version) installed, this repo pins $($d.Version). Left as is."
+        }
+    }
+}
+
+# Downloads a dependency's installer into $InstallerDir and checks its SHA-256.
+# A file that is already there and matches is reused. Returns the file path.
+function Save-Installer($Dep) {
+    if (-not (Test-Path -LiteralPath $InstallerDir)) { New-Item -ItemType Directory -Path $InstallerDir | Out-Null }
+    $file = Join-Path $InstallerDir ([IO.Path]::GetFileName(([uri]$Dep.Url).AbsolutePath))
+    if ((Test-Path -LiteralPath $file) -and (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -eq $Dep.Sha256) {
+        Write-Ok "$($Dep.Name) $($Dep.Version): already downloaded, checksum OK."
+        return $file
+    }
+    Write-Host "    $($Dep.Name) $($Dep.Version): downloading $($Dep.Url)"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $partial = "$file.part"
+    $previous = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'   # the progress bar makes downloads very slow in Windows PowerShell
+    try     { Invoke-WebRequest -Uri $Dep.Url -OutFile $partial -UseBasicParsing }
+    finally { $ProgressPreference = $previous }
+    $hash = (Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash
+    if ($hash -ne $Dep.Sha256) {
+        Remove-Item -LiteralPath $partial
+        throw "Checksum mismatch for $($Dep.Name) (got $hash, expected $($Dep.Sha256)). The download was deleted and not run."
+    }
+    Move-Item -LiteralPath $partial -Destination $file -Force
+    Write-Ok "$($Dep.Name) $($Dep.Version): downloaded, checksum OK."
+    return $file
+}
+
+function Install-Dependency($Dep) {
+    $file = Save-Installer $Dep
+    Write-Host "    $($Dep.Name) $($Dep.Version): installing..."
+    $p = Start-Process -FilePath $file -ArgumentList $Dep.Args -Wait -PassThru
+    if ($p.ExitCode -ne 0) { throw "$($Dep.Name) installer failed (exit code $($p.ExitCode))." }
+    Write-Ok "$($Dep.Name) $($Dep.Version) installed."
+}
+
+function Test-Admin {
+    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# --- Download-only mode -----------------------------------------------------
+if ($DownloadOnly) {
+    Write-Step "Downloading pinned installers into $InstallerDir"
+    foreach ($d in $Dependencies) { Save-Installer $d | Out-Null }
+    Write-Host ''
+    Write-Host 'Done. Nothing was installed.' -ForegroundColor Cyan
+    exit 0
+}
+
 # --- 0. Preconditions -------------------------------------------------------
 Write-Step 'Checking preconditions'
 
 if (Get-Process -Name obs64, obs32 -ErrorAction SilentlyContinue) {
     throw 'OBS is running. Close OBS and run this again.'
 }
+
+# --- Elevated run: install missing dependencies only ------------------------
+if ($DependenciesOnly) {
+    Write-Step 'Installing missing OBS, VLC and plugins (admin)'
+    foreach ($d in @(Get-MissingDependency $true)) { Install-Dependency $d }
+    Write-Host ''
+    Write-Host 'Done. This window closes in 5 seconds.' -ForegroundColor Cyan
+    Start-Sleep -Seconds 5
+    exit 0
+}
+
 foreach ($f in $SceneSrc, $VerticalSrc) {
     if (-not (Test-Path -LiteralPath $f)) { throw "Missing from the repo: $f" }
 }
@@ -144,7 +281,33 @@ if (Test-Path -LiteralPath $globalIni) {
 Write-Ok "Repo:       $RepoRoot"
 Write-Ok "OBS config: $ObsConfigDir"
 
-# --- 1. VDO.Ninja stream ID and commit filter --------------------------------
+# --- 1. OBS, VLC and plugins ------------------------------------------------
+Write-Step 'OBS, VLC and plugins'
+
+if ($SkipDependencies) {
+    Write-Note 'Skipped (-SkipDependencies).'
+} else {
+    $missing = @(Get-MissingDependency $false)
+    if ($missing.Count -gt 0) {
+        if (Test-Admin) {
+            foreach ($d in $missing) { Install-Dependency $d }
+        } else {
+            Write-Host "    Installing $($missing.Count) program(s) needs admin rights. Windows will ask for permission..."
+            $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DependenciesOnly"
+            try {
+                $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -Wait -PassThru
+            } catch {
+                throw 'Admin permission was refused, so OBS, VLC and the plugins were not installed. Run again to retry, or use -SkipDependencies.'
+            }
+            if ($p.ExitCode -ne 0) { throw "Installing the dependencies failed (exit code $($p.ExitCode)). See the admin window's message." }
+        }
+        $still = @(Get-MissingDependency $true)
+        if ($still.Count -gt 0) { throw "Still not installed after running the installers: $(($still | ForEach-Object { $_.Name }) -join ', ')" }
+        Write-Ok 'All dependencies installed.'
+    }
+}
+
+# --- 2. VDO.Ninja stream ID and commit filter --------------------------------
 Write-Step 'VDO.Ninja stream ID'
 
 if (-not $VdoNinjaId -and $haveGit) { $VdoNinjaId = Invoke-Git config vdoninja.streamid }
@@ -175,7 +338,7 @@ if ($haveGit) {
 }
 if (-not $VdoNinjaId) { Write-Note 'No ID given: the VDO.Ninja source will not connect until you set its URL in OBS.' }
 
-# --- 2. Scene collection (includes the Lua scripts) -------------------------
+# --- 3. Scene collection (includes the Lua scripts) -------------------------
 Write-Step 'Scene collection and scripts'
 
 $scene = Read-Text $SceneSrc
@@ -199,7 +362,7 @@ Install-TextFile -Path $sceneDest -Content $scene -Encoding $Utf8NoBom -Overwrit
 $scripts = [regex]::Matches($scene, '"path"\s*:\s*"([^"]+\.lua)"') | ForEach-Object { $_.Groups[1].Value }
 foreach ($s in $scripts) { Write-Ok "Script registered: $s" }
 
-# --- 3. Make it the active scene collection ---------------------------------
+# --- 4. Make it the active scene collection ---------------------------------
 Write-Step 'Active scene collection'
 
 $userIni = Join-Path $ObsConfigDir 'user.ini'
@@ -227,7 +390,7 @@ $newIni = ($lines -join "`n")
 if (-not $newIni.EndsWith("`n")) { $newIni += "`n" }
 Install-TextFile -Path $userIni -Content $newIni -Encoding $Utf8Bom -Overwrite $true -What 'OBS user settings'
 
-# --- 4. Aitum Vertical settings ---------------------------------------------
+# --- 5. Aitum Vertical settings ---------------------------------------------
 Write-Step 'Aitum Vertical settings'
 
 $vertical   = Read-Text $VerticalSrc
@@ -238,7 +401,7 @@ $vertical   = [regex]::Replace($vertical,
 $verticalDest = Join-Path $ObsConfigDir 'plugin_config\vertical-canvas\config.json'
 Install-TextFile -Path $verticalDest -Content $vertical -Encoding $Utf8NoBom -Overwrite $Force.IsPresent -What 'Vertical canvas settings'
 
-# --- 5. Font ----------------------------------------------------------------
+# --- 6. Font ----------------------------------------------------------------
 Write-Step 'Font'
 
 if ($SkipFont) {
@@ -262,7 +425,7 @@ if ($SkipFont) {
     }
 }
 
-# --- 6. Files the scene uses that are not in the repo -----------------------
+# --- 7. Files the scene uses that are not in the repo -----------------------
 Write-Step 'Media check'
 
 $refs = [regex]::Matches($scene, '"(?:file|local_file|image_path|path|value)"\s*:\s*"(' + [regex]::Escape($newRoot) + '/[^"]+)"') |

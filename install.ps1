@@ -1,27 +1,36 @@
 <#
 .SYNOPSIS
-    Installs this repo's OBS configuration into OBS Studio on this PC.
+    Installs this repo's OBS setup on this PC.
 
 .DESCRIPTION
     Installs:
-      - OBS Studio, VLC and the OBS plugins this setup uses, each pinned to the
-        version it was built with. Each installer is downloaded from its official
-        source into .\installers, checked against a SHA-256 written in this
-        script, and run silently. Anything already installed is left alone,
-        even if its version differs. Installing needs admin rights, so Windows
-        asks once (UAC) when something is missing.
+      - OBS Studio, VLC and the OBS plugins this setup uses, at their LATEST
+        release. Each one also records the version this setup was last tested
+        with; installing anything newer prints a warning. Each installer is
+        downloaded from its official source into .\installers, checked against
+        the SHA-256 its publisher lists and against its code signature, then
+        run silently. Programs that are already installed are only reported
+        when a newer version exists; -Upgrade installs it. Installing needs
+        admin rights, so Windows asks once (UAC).
       - The scene collection, with every path rewritten to wherever this repo
         was cloned. The Lua scripts and their settings are part of the scene
         collection, so they are installed with it.
+      - The Audio Transition script by dqm, which isn't part of this repo: its
+        latest version is downloaded from the OBS forum into Scripts\, with a
+        warning when it differs from the tested version. An existing copy is
+        only replaced with -Upgrade.
       - The scene collection becomes the active one in OBS.
       - The Aitum Vertical (vertical canvas) settings.
-      - The IRZar font, for the current user only (no admin needed).
+      - The IRZar font, for the current user only (no admin needed), if you've
+        put IRZar.ttf in Fonts\. It isn't part of this repo (see README).
       - The VDO.Ninja stream ID, plus the git filter that keeps it out of commits.
-      - The live tickers (github.com/Vazirified/live-tickers, a separate repo):
-        Python 3.14.2 for the current user if missing (no admin needed), a
-        clone pinned to tag v2.0.0 in Scripts\live-tickers-v.2.0, and its
-        setup.bat. An existing tickers folder is left alone. MetaTrader 5 is
-        not installed (it needs your broker login); you are told if it's missing.
+      - The live tickers (github.com/Vazirified/live-tickers, a separate repo),
+        following the latest commit on its main branch: cloned into
+        Scripts\live-tickers-v.2.0, or an existing clone updated when it has no
+        local changes. Python 3.14.2 is installed for the current user if
+        missing, and the tickers' setup.bat runs when .venv is missing or
+        requirements.txt changed. MetaTrader 5 is not installed (it needs your
+        broker login); you are told if it's missing.
 
     Safe to run again: files that are already up to date are left alone. If an
     installed file has different content, the script stops unless -Force is
@@ -38,6 +47,14 @@
     Overwrite a scene collection or vertical config that differs from this repo
     (the old file is backed up first).
 
+.PARAMETER Upgrade
+    Also upgrade OBS, VLC and plugins that are installed at an older version.
+    Without it, installed programs are never changed.
+
+.PARAMETER Tested
+    Use the last tested versions instead of the latest releases (for new
+    installs and -Upgrade). Never downgrades anything.
+
 .PARAMETER SkipFont
     Do not install the font.
 
@@ -45,19 +62,21 @@
     Do not check or install OBS, VLC and the plugins.
 
 .PARAMETER SkipTickers
-    Do not set up the live tickers (or Python).
+    Do not set up or update the live tickers (or Python).
 
 .PARAMETER DownloadOnly
-    Only download and check all pinned installers into .\installers (for an
-    offline copy), then stop. Installs nothing.
+    Only download and verify the installers a run would use (latest, or the
+    tested ones with -Tested) into .\installers, then stop. Installs nothing.
 
 .PARAMETER DependenciesOnly
-    Used internally: the elevated (admin) run that installs missing dependencies.
+    Used internally: the elevated (admin) run that installs dependencies.
 
 .EXAMPLE
     .\install.bat
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File install.ps1 -Force
+    .\install.bat -Upgrade
+.EXAMPLE
+    .\install.bat -Tested
 .EXAMPLE
     .\install.bat -DownloadOnly
 #>
@@ -66,6 +85,8 @@ param(
     [string]$ObsConfigDir = (Join-Path $env:APPDATA 'obs-studio'),
     [string]$VdoNinjaId,
     [switch]$Force,
+    [switch]$Upgrade,
+    [switch]$Tested,
     [switch]$SkipFont,
     [switch]$SkipDependencies,
     [switch]$SkipTickers,
@@ -76,6 +97,7 @@ param(
 Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'
 $ObsConfigDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ObsConfigDir).TrimEnd('\')
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # Show errors as one readable line instead of a PowerShell stack dump.
 trap {
@@ -95,49 +117,84 @@ $SceneFileName   = 'Double_Output_Vazirified_Channels.json'
 $Placeholder     = '__VDO_NINJA_STREAM_ID__'
 $InstallerDir    = Join-Path $RepoRoot 'installers'
 
-# --- Pinned dependencies -----------------------------------------------------
-# Versions match the PC this setup was built on. To update one, change Version,
-# Url and Sha256 together (GitHub shows each release file's sha256 digest).
-# Match is a regex on the program's name in Windows "Installed apps"; installers
-# run in this order (OBS first, the plugin installers look for it).
+# --- Dependencies: latest release, with the last tested version on record -----
+# A run installs the newest release of each. "Tested" is the version this setup
+# was last checked with; installing any other version prints a warning. After
+# testing a newer version, copy its Version, Url and Sha256 into Tested (GitHub
+# shows each release file's sha256). Tested is also what -Tested installs, and
+# the fallback when the latest release can't be looked up.
+#   Match:  regex on the program's name in Windows "Installed apps"
+#   Signer: publisher expected in the installer's code signature
+#   Assets: regexes for the release file, first match wins ({ObsMajor} = OBS major version)
+# Installers run in this order (OBS first: the plugin installers look for it).
 $InnoSilent = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'
 $Dependencies = @(
-    @{ Name = 'OBS Studio';          Version = '33.0.1'; Match = '^OBS Studio$'
-       Url  = 'https://github.com/obsproject/obs-studio/releases/download/33.0.1/OBS-Studio-33.0.1-Windows-x64-Installer.exe'
-       Sha256 = '37ecde4d9a28e8aeeb07623c8469b5d558eb264e02ccf435bb859891c401758b'; Args = '/S' }
-    @{ Name = 'VLC media player';    Version = '3.0.23'; Match = '^VLC media player$'
-       Url  = 'https://download.videolan.org/pub/videolan/vlc/3.0.23/win64/vlc-3.0.23-win64.exe'
-       Sha256 = '20ad191348684b470ddc4e05204316f3d8e39655f412b3e392a0eef97639daaf'; Args = '/S' }
-    @{ Name = 'DroidCam OBS plugin'; Version = '2.5.1';  Match = '^DroidCam OBS Plugin'
-       Url  = 'https://github.com/dev47apps/droidcam-obs-plugin/releases/download/2.5.1/DroidCamOBS.Setup.2.5.1.exe'
-       Sha256 = 'fb20d899cd2aa45b3670e7ee10a5e90130dc489321770dd271b701d82522db31'; Args = '/S' }
-    @{ Name = 'Move Transition';     Version = '3.2.1';  Match = '^move-transition version'
-       Url  = 'https://github.com/exeldro/obs-move-transition/releases/download/3.2.1/move-transition-3.2.1-windows-installer.exe'
-       Sha256 = 'a3777ac68c0e7c86dbab8ea94146dbf4a48223e128696c32defd99ddaa56f8c8'; Args = $InnoSilent }
-    @{ Name = 'Aitum Vertical';      Version = '1.6.1';  Match = '^vertical-canvas version'
-       Url  = 'https://github.com/Aitum/obs-vertical-canvas/releases/download/1.6.1/vertical-canvas-windows-installer.exe'
-       Sha256 = '455dc673290b7098a72b1c72705b86ad80118e2fefd149970f566ad64dd6ee6c'; Args = $InnoSilent }
-    @{ Name = 'Face Tracker';        Version = '0.9.0';  Match = '^obs-face-tracker version'
-       Url  = 'https://github.com/norihiro/obs-face-tracker/releases/download/0.9.0/obs-face-tracker-0.9.0-obs30-Windows-Installer.exe'
-       Sha256 = 'cd344c60f2df8c9e6af98a2821cf52f7ed1b25221c25f20b889d53b2bb1864f6'; Args = $InnoSilent }
+    @{ Name = 'OBS Studio'; Match = '^OBS Studio$'; Args = '/S'; Signer = 'OBS Project'
+       Repo = 'obsproject/obs-studio'; Assets = @('^OBS-Studio-[\d.]+-Windows-x64-Installer\.exe$')
+       Tested = @{ Version = '33.0.1'
+           Url    = 'https://github.com/obsproject/obs-studio/releases/download/33.0.1/OBS-Studio-33.0.1-Windows-x64-Installer.exe'
+           Sha256 = '37ecde4d9a28e8aeeb07623c8469b5d558eb264e02ccf435bb859891c401758b' } }
+    @{ Name = 'VLC media player'; Match = '^VLC media player$'; Args = '/S'; Signer = 'VideoLAN'
+       Tested = @{ Version = '3.0.23'
+           Url    = 'https://download.videolan.org/pub/videolan/vlc/3.0.23/win64/vlc-3.0.23-win64.exe'
+           Sha256 = '20ad191348684b470ddc4e05204316f3d8e39655f412b3e392a0eef97639daaf' } }
+    @{ Name = 'DroidCam OBS plugin'; Match = '^DroidCam OBS Plugin'; Args = '/S'; Signer = 'DEV47 APPS'
+       Repo = 'dev47apps/droidcam-obs-plugin'
+       # The build made for the OBS major version in use if there is one, else the general build.
+       Assets = @('^DroidCamOBS\.Setup\.[\d.]+\.obs{ObsMajor}_\d+\.exe$', '^DroidCamOBS\.Setup\.[\d.]+\.exe$')
+       Tested = @{ Version = '2.5.1'
+           Url    = 'https://github.com/dev47apps/droidcam-obs-plugin/releases/download/2.5.1/DroidCamOBS.Setup.2.5.1.exe'
+           Sha256 = 'fb20d899cd2aa45b3670e7ee10a5e90130dc489321770dd271b701d82522db31' } }
+    @{ Name = 'Move Transition'; Match = '^move-transition version'; Args = $InnoSilent; Signer = 'Exeldro'
+       Repo = 'exeldro/obs-move-transition'; Assets = @('^move-transition-[\d.]+-windows-installer\.exe$')
+       Tested = @{ Version = '3.2.1'
+           Url    = 'https://github.com/exeldro/obs-move-transition/releases/download/3.2.1/move-transition-3.2.1-windows-installer.exe'
+           Sha256 = 'a3777ac68c0e7c86dbab8ea94146dbf4a48223e128696c32defd99ddaa56f8c8' } }
+    @{ Name = 'Aitum Vertical'; Match = '^vertical-canvas version'; Args = $InnoSilent; Signer = 'Aitum'
+       Repo = 'Aitum/obs-vertical-canvas'; Assets = @('^vertical-canvas-windows-installer\.exe$')
+       Tested = @{ Version = '1.6.1'
+           Url    = 'https://github.com/Aitum/obs-vertical-canvas/releases/download/1.6.1/vertical-canvas-windows-installer.exe'
+           Sha256 = '455dc673290b7098a72b1c72705b86ad80118e2fefd149970f566ad64dd6ee6c' } }
+    @{ Name = 'Face Tracker'; Match = '^obs-face-tracker version'; Args = $InnoSilent; Signer = 'Norihiro Kamae'
+       Repo = 'norihiro/obs-face-tracker'; Assets = @('^obs-face-tracker-[\d.]+-obs\d+-Windows-Installer\.exe$')
+       Tested = @{ Version = '0.9.0'
+           Url    = 'https://github.com/norihiro/obs-face-tracker/releases/download/0.9.0/obs-face-tracker-0.9.0-obs30-Windows-Installer.exe'
+           Sha256 = 'cd344c60f2df8c9e6af98a2821cf52f7ed1b25221c25f20b889d53b2bb1864f6' } }
 )
 
-# Live tickers: their own repo, cloned next to the other scripts. OBS loads them
-# from http://localhost:5000 (started by the tickers' run.bat), not from disk.
-$TickersUrl = 'https://github.com/Vazirified/live-tickers.git'
-$TickersTag = 'v2.0.0'
-$TickersDir = Join-Path $RepoRoot 'Scripts\live-tickers-v.2.0'
+# Live tickers: their own repo, following the latest commit on main. OBS loads
+# them from http://localhost:5000 (started by the tickers' run.bat), not from disk.
+$TickersUrl    = 'https://github.com/Vazirified/live-tickers.git'
+$TickersBranch = 'main'
+$TickersDir    = Join-Path $RepoRoot 'Scripts\live-tickers-v.2.0'
 
-# Python for the tickers' virtual environment. Installed for the current user
-# only, so it needs no admin rights.
-$Python = @{ Name = 'Python'; Version = '3.14.2'; Minor = '3.14'
-    Url    = 'https://www.python.org/ftp/python/3.14.2/python-3.14.2-amd64.exe'
-    Sha256 = '9db919cefe30a0051658c600a9912acb0cd2b872aaf35842c9ec2bf401efa848'
-    Args   = '/quiet InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1 Include_test=0' }
+# Python for the tickers' virtual environment. Stays pinned: the MetaTrader5
+# package only ships for particular Python versions. Installed for the current
+# user only, so it needs no admin rights.
+$Python = @{ Name = 'Python'; Minor = '3.14'; Signer = 'Python Software Foundation'
+    Args   = '/quiet InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1 Include_test=0'
+    Tested = @{ Version = '3.14.2'
+        Url    = 'https://www.python.org/ftp/python/3.14.2/python-3.14.2-amd64.exe'
+        Sha256 = '9db919cefe30a0051658c600a9912acb0cd2b872aaf35842c9ec2bf401efa848' } }
+
+# Audio Transition script by dqm. Published as a zip on the OBS forum (no git
+# repo, no license to share it), so it's downloaded into Scripts\ instead of
+# being part of this repo. No checksum is published: the SHA-256 recorded here
+# is of audio-transition.lua in the tested version, and any other file prints a
+# warning.
+$AudioTransition = @{ Name = 'Audio Transition script'; Entry = 'audio-transition.lua'
+    Page      = 'https://obsproject.com/forum/resources/audio-transition.2117/'
+    LatestUrl = 'https://obsproject.com/forum/resources/audio-transition.2117/download'
+    Tested    = @{ Version = '1.1'
+        Url    = 'https://obsproject.com/forum/resources/audio-transition.2117/version/6177/download'
+        Sha256 = '2964875db4f60df11823da92ab35351d4fe873c6e755bbbadb37a2a1c8920e8a' } }
+$AudioTransitionDest = Join-Path $RepoRoot 'Scripts\audio-transition.lua'
 
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $Utf8Bom   = New-Object System.Text.UTF8Encoding($true)
 $Stamp     = Get-Date -Format 'yyyyMMdd-HHmmss'
+$GitHubHeaders = @{ 'User-Agent' = 'obs-setup-installer'; 'Accept' = 'application/vnd.github+json' }
+$ResolvedReleases = @{}
 
 function Write-Step([string]$Message) { Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-Ok([string]$Message)   { Write-Host "    $Message" -ForegroundColor Green }
@@ -177,11 +234,21 @@ function Install-TextFile {
     Write-Ok "$What installed: $Path"
 }
 
+# Runs git in this repo. Windows PowerShell 5.1 turns git's normal stderr
+# chatter into errors under 'Stop', so relax it here. $LASTEXITCODE is kept.
 function Invoke-Git {
-    # Windows PowerShell 5.1 turns git's normal stderr chatter into errors under 'Stop', so relax it here.
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try     { $output = & git -C $RepoRoot @args 2>$null }
+    finally { $ErrorActionPreference = $previous }
+    return $output
+}
+
+# Same, in another folder (the first argument).
+function Invoke-GitIn([string]$Dir) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try     { $output = & git -C $Dir @args 2>$null }
     finally { $ErrorActionPreference = $previous }
     return $output
 }
@@ -199,55 +266,153 @@ function Get-InstalledApp {
         }
 }
 
-# Returns the dependencies that are not installed at all, and reports the rest.
-function Get-MissingDependency([bool]$Quiet) {
-    $apps = @(Get-InstalledApp)
-    foreach ($d in $Dependencies) {
-        $hit = $apps | Where-Object { $_.Name -match $d.Match } | Select-Object -First 1
-        if (-not $hit) {
-            if (-not $Quiet) { Write-Note "$($d.Name) $($d.Version): not installed" }
-            $d
-        } elseif ($Quiet) {
-        } elseif ($hit.Version -eq $d.Version) {
-            Write-Ok "$($d.Name) $($d.Version) installed."
-        } else {
-            Write-Note "$($d.Name): $($hit.Version) installed, this repo pins $($d.Version). Left as is."
+# -1, 0 or 1. Numeric where both sides parse as versions, text otherwise.
+function Compare-Version([string]$A, [string]$B) {
+    $va = $null; $vb = $null
+    if ([version]::TryParse($A, [ref]$va) -and [version]::TryParse($B, [ref]$vb)) { return [math]::Sign($va.CompareTo($vb)) }
+    return [math]::Sign([string]::CompareOrdinal($A, $B))
+}
+
+function Get-WebText([string]$Url) {
+    $content = (Invoke-WebRequest -Uri $Url -UseBasicParsing).Content
+    if ($content -is [byte[]]) { $content = [Text.Encoding]::ASCII.GetString($content) }
+    return [string]$content
+}
+
+# The newest release of a dependency: @{ Version; Url; Sha256 (or $null); Latest }.
+function Get-LatestRelease($Dep, [string]$ObsMajor) {
+    if ($Dep.ContainsKey('Repo')) {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$($Dep.Repo)/releases/latest" -Headers $GitHubHeaders -UseBasicParsing
+        $version = $release.tag_name -replace '^[vV]', ''
+        foreach ($pattern in $Dep.Assets) {
+            $pattern = $pattern.Replace('{ObsMajor}', $ObsMajor)
+            $asset = @($release.assets | Where-Object { $_.name -match $pattern } | Sort-Object name) | Select-Object -Last 1
+            if ($asset) {
+                $sha = $null
+                if ($asset.PSObject.Properties['digest'] -and "$($asset.digest)" -match '^sha256:([0-9a-fA-F]{64})$') { $sha = $Matches[1] }
+                return @{ Version = $version; Url = $asset.browser_download_url; Sha256 = $sha; Latest = $true }
+            }
         }
+        throw "release $version has no matching Windows installer"
+    }
+    # VLC: VideoLAN keeps the newest release in 'last', with a .sha256 file next to the installer.
+    $base = 'https://download.videolan.org/pub/videolan/vlc'
+    $page = Get-WebText "$base/last/win64/"
+    if ($page -notmatch 'vlc-(\d+(?:\.\d+)+)-win64\.exe"') { throw 'no installer found in the download folder' }
+    $version = $Matches[1]
+    $url = "$base/$version/win64/vlc-$version-win64.exe"
+    if ((Get-WebText "$url.sha256") -notmatch '^([0-9a-fA-F]{64})\s') { throw 'no checksum file for the installer' }
+    return @{ Version = $version; Url = $url; Sha256 = $Matches[1]; Latest = $true }
+}
+
+# What to install for a dependency: the latest release, or the tested version
+# with -Tested or when the lookup fails. Looked up once per run.
+function Resolve-Target($Dep, [string]$ObsMajor) {
+    if ($ResolvedReleases.ContainsKey($Dep.Name)) { return $ResolvedReleases[$Dep.Name] }
+    # $script: so a caller's local variable can't shadow the switch (names are case-insensitive).
+    if ($script:Tested) {
+        $target = $Dep.Tested + @{ Latest = $false }
+    } else {
+        try {
+            $target = Get-LatestRelease $Dep $ObsMajor
+        } catch {
+            Write-Note "$($Dep.Name): could not look up the latest release ($($_.Exception.Message)). Using the last tested version, $($Dep.Tested.Version)."
+            $target = $Dep.Tested + @{ Latest = $false }
+        }
+    }
+    $ResolvedReleases[$Dep.Name] = $target
+    return $target
+}
+
+# Compares installed versions with the target versions and returns, in install
+# order, the @{ Dep; Release } entries to install. Reports each one unless $Quiet.
+function Get-DependencyPlan([bool]$Quiet) {
+    $apps = @(Get-InstalledApp)
+    $obsMajor = ''
+    foreach ($d in $Dependencies) {
+        $hit       = $apps | Where-Object { $_.Name -match $d.Match } | Select-Object -First 1
+        $installed = if ($hit) { "$($hit.Version)" } else { $null }
+        $target    = Resolve-Target $d $obsMajor
+        $testedVersion = $d.Tested.Version
+        $kind      = if ($target.Latest) { 'latest' } else { 'tested' }
+        $warning   = if ($target.Version -ne $testedVersion) { " WARNING: not tested with this setup yet (last tested: $testedVersion)." } else { '' }
+        $install   = $false
+
+        if (-not $installed) {
+            if (-not $Quiet) { Write-Note "$($d.Name): not installed. Will install $($target.Version) ($kind).$warning" }
+            $install = $true
+        } elseif ((Compare-Version $installed $target.Version) -lt 0) {
+            if ($script:Upgrade) {
+                if (-not $Quiet) { Write-Note "$($d.Name): will upgrade $installed to $($target.Version) ($kind).$warning" }
+                $install = $true
+            } elseif (-not $Quiet) {
+                $testedInfo = if ($target.Version -ne $testedVersion) { "not tested with this setup yet; last tested: $testedVersion" } else { 'tested' }
+                Write-Note "$($d.Name) $installed installed. Newer $kind version $($target.Version) is available ($testedInfo). Run install.bat -Upgrade to install it."
+            }
+        } elseif (-not $Quiet) {
+            if ($installed -eq $testedVersion) { Write-Ok "$($d.Name) $installed installed (tested)." }
+            else { Write-Note "$($d.Name) $installed installed. Not tested with this setup yet (last tested: $testedVersion)." }
+        }
+
+        if ($d.Name -eq 'OBS Studio') {
+            $obsVersion = if ($install -or -not $installed) { $target.Version } else { $installed }
+            $obsMajor = ($obsVersion -split '\.')[0]
+        }
+        if ($install) { @{ Dep = $d; Release = $target } }
     }
 }
 
-# Downloads a dependency's installer into $InstallerDir and checks its SHA-256.
-# A file that is already there and matches is reused. Returns the file path.
-function Save-Installer($Dep) {
-    if (-not (Test-Path -LiteralPath $InstallerDir)) { New-Item -ItemType Directory -Path $InstallerDir | Out-Null }
-    $file = Join-Path $InstallerDir ([IO.Path]::GetFileName(([uri]$Dep.Url).AbsolutePath))
-    if ((Test-Path -LiteralPath $file) -and (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -eq $Dep.Sha256) {
-        Write-Ok "$($Dep.Name) $($Dep.Version): already downloaded, checksum OK."
+# Checks an installer file: its SHA-256 (when one is known) and its code signature.
+# Returns $null when it's fine, otherwise what's wrong.
+function Get-InstallerProblem([string]$File, $Release, [string]$Signer) {
+    if ($Release.Sha256) {
+        $hash = (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash
+        if ($hash -ne $Release.Sha256) { return "checksum mismatch (got $hash, expected $($Release.Sha256))" }
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $File
+    if ($signature.Status -ne 'Valid') { return "code signature is not valid ($($signature.Status))" }
+    if ($signature.SignerCertificate.Subject -notmatch [regex]::Escape($Signer)) {
+        return "signed by '$($signature.SignerCertificate.Subject)', expected '$Signer'"
+    }
+    return $null
+}
+
+# Downloads an installer into $InstallerDir\<name> <version>\ and verifies it.
+# A verified file that is already there is reused. Returns the file path.
+function Save-Installer($Dep, $Release) {
+    $label  = "$($Dep.Name) $($Release.Version)"
+    $folder = Join-Path $InstallerDir $label
+    if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $file = Join-Path $folder ([IO.Path]::GetFileName(([uri]$Release.Url).AbsolutePath))
+    $checks = if ($Release.Sha256) { 'checksum and signature OK' } else { 'signature OK (no checksum published)' }
+
+    if ((Test-Path -LiteralPath $file) -and -not (Get-InstallerProblem $file $Release $Dep.Signer)) {
+        Write-Ok "${label}: already downloaded, $checks."
         return $file
     }
-    Write-Host "    $($Dep.Name) $($Dep.Version): downloading $($Dep.Url)"
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Write-Host "    ${label}: downloading $($Release.Url)"
     $partial = "$file.part"
     $previous = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'   # the progress bar makes downloads very slow in Windows PowerShell
-    try     { Invoke-WebRequest -Uri $Dep.Url -OutFile $partial -UseBasicParsing }
+    try     { Invoke-WebRequest -Uri $Release.Url -OutFile $partial -UseBasicParsing }
     finally { $ProgressPreference = $previous }
-    $hash = (Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash
-    if ($hash -ne $Dep.Sha256) {
+    $problem = Get-InstallerProblem $partial $Release $Dep.Signer
+    if ($problem) {
         Remove-Item -LiteralPath $partial
-        throw "Checksum mismatch for $($Dep.Name) (got $hash, expected $($Dep.Sha256)). The download was deleted and not run."
+        throw "${label}: $problem. The download was deleted and not run."
     }
     Move-Item -LiteralPath $partial -Destination $file -Force
-    Write-Ok "$($Dep.Name) $($Dep.Version): downloaded, checksum OK."
+    Write-Ok "${label}: downloaded, $checks."
     return $file
 }
 
-function Install-Dependency($Dep) {
-    $file = Save-Installer $Dep
-    Write-Host "    $($Dep.Name) $($Dep.Version): installing..."
-    $p = Start-Process -FilePath $file -ArgumentList $Dep.Args -Wait -PassThru
-    if ($p.ExitCode -ne 0) { throw "$($Dep.Name) installer failed (exit code $($p.ExitCode))." }
-    Write-Ok "$($Dep.Name) $($Dep.Version) installed."
+function Install-Dependency($Item) {
+    $d = $Item.Dep; $r = $Item.Release
+    $file = Save-Installer $d $r
+    Write-Host "    $($d.Name) $($r.Version): installing..."
+    $p = Start-Process -FilePath $file -ArgumentList $d.Args -Wait -PassThru
+    if ($p.ExitCode -ne 0) { throw "$($d.Name) installer failed (exit code $($p.ExitCode))." }
+    Write-Ok "$($d.Name) $($r.Version) installed."
 }
 
 # Finds Python <Minor> through the registry entries every Python installer writes
@@ -268,15 +433,135 @@ function Find-Python([string]$Minor) {
     return $null
 }
 
+# Brings an existing tickers clone to the latest commit on $TickersBranch, but
+# only when that is safe: right repo, no local changes, no local-only commits.
+# Returns $true if requirements.txt changed (packages need reinstalling).
+function Update-TickersClone([string]$Rel) {
+    $norm   = { param($u) ("$u" -replace '\.git$', '').TrimEnd('/').ToLowerInvariant() }
+    $origin = Invoke-GitIn $TickersDir remote get-url origin
+    if ((& $norm $origin) -ne (& $norm $TickersUrl)) {
+        Write-Note "$Rel comes from '$origin', not $TickersUrl. Not updated."
+        return $false
+    }
+    if (@(Invoke-GitIn $TickersDir status --porcelain).Count -gt 0) {
+        Write-Note "$Rel has local changes. Not updated: commit or discard them to get the latest version."
+        return $false
+    }
+    $before = Invoke-GitIn $TickersDir rev-parse HEAD
+    Invoke-GitIn $TickersDir fetch --quiet origin $TickersBranch | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Note "Could not reach GitHub to check for ticker updates. Using the version already here."
+        return $false
+    }
+    $branch = Invoke-GitIn $TickersDir rev-parse --abbrev-ref HEAD
+    if ($branch -eq 'HEAD') {
+        # Detached, e.g. checked out at a tag by an earlier version of this installer.
+        if (Invoke-GitIn $TickersDir rev-parse --verify --quiet "refs/heads/$TickersBranch") {
+            Invoke-GitIn $TickersDir checkout --quiet $TickersBranch | Out-Null
+        } else {
+            Invoke-GitIn $TickersDir checkout --quiet -b $TickersBranch --track "origin/$TickersBranch" | Out-Null
+        }
+        if ($LASTEXITCODE -ne 0) { Write-Note "Could not switch $Rel to $TickersBranch. Not updated."; return $false }
+    } elseif ($branch -ne $TickersBranch) {
+        Write-Note "$Rel is on branch '$branch', not $TickersBranch. Not updated."
+        return $false
+    }
+    Invoke-GitIn $TickersDir merge --ff-only --quiet "origin/$TickersBranch" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Note "$Rel has commits that are not on GitHub's $TickersBranch. Not updated: push or reset them first."
+        return $false
+    }
+    $after = Invoke-GitIn $TickersDir rev-parse HEAD
+    $now   = Invoke-GitIn $TickersDir describe --tags --always
+    $ahead = [int](Invoke-GitIn $TickersDir rev-list --count "origin/$TickersBranch..HEAD")
+    if ($before -eq $after) {
+        if ($ahead -gt 0) { Write-Note "$Rel has $ahead commit(s) that are not on GitHub yet ($now). Left as is." }
+        else              { Write-Ok "$Rel is already at the latest $TickersBranch ($now)." }
+        return $false
+    }
+    Write-Ok "$Rel updated to the latest $TickersBranch ($now)."
+    Invoke-GitIn $TickersDir diff --quiet $before $after -- requirements.txt | Out-Null
+    return ($LASTEXITCODE -ne 0)
+}
+
 function Test-Admin {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# The version written in the Audio Transition script: version = "v1.1 by DQM ...".
+function Get-AudioTransitionVersion([string]$Text) {
+    if ($Text -match 'version\s*=\s*"v?(\d+(?:\.\d+)+)') { return $Matches[1] }
+    return $null
+}
+
+# Downloads the Audio Transition zip (the latest, or the tested version) into
+# $InstallerDir\Audio Transition script <version>\ and returns
+# @{ Bytes; Version; IsTested } for audio-transition.lua inside it.
+function Get-AudioTransitionRelease([bool]$UseTested) {
+    $url = if ($UseTested) { $AudioTransition.Tested.Url } else { $AudioTransition.LatestUrl }
+    if (-not (Test-Path -LiteralPath $InstallerDir)) { New-Item -ItemType Directory -Path $InstallerDir | Out-Null }
+    $partial = Join-Path $InstallerDir 'audio-transition.zip.part'
+    $previous = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try     { Invoke-WebRequest -Uri $url -OutFile $partial -UseBasicParsing }
+    finally { $ProgressPreference = $previous }
+
+    # Read only the one expected file from the zip (nothing is extracted to disk).
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($partial)
+    try {
+        $entry = $archive.Entries | Where-Object { $_.FullName -eq $AudioTransition.Entry } | Select-Object -First 1
+        if (-not $entry) { throw "the download has no $($AudioTransition.Entry)" }
+        $stream = $entry.Open()
+        try     { $buffer = New-Object IO.MemoryStream; $stream.CopyTo($buffer); $bytes = $buffer.ToArray() }
+        finally { $stream.Dispose() }
+    } finally { $archive.Dispose() }
+
+    $sha  = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-', '')
+    $text = [Text.Encoding]::UTF8.GetString($bytes)
+    if ($text -notmatch 'obslua' -or $text -notmatch 'Audio Transition') {
+        Remove-Item -LiteralPath $partial
+        throw 'the download is not the Audio Transition script'
+    }
+    if ($UseTested -and $sha -ne $AudioTransition.Tested.Sha256) {
+        Remove-Item -LiteralPath $partial
+        throw "checksum mismatch for the tested version (got $sha, expected $($AudioTransition.Tested.Sha256))"
+    }
+    $version = Get-AudioTransitionVersion $text
+    $folder  = Join-Path $InstallerDir "$($AudioTransition.Name) $version"
+    if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder | Out-Null }
+    Move-Item -LiteralPath $partial -Destination (Join-Path $folder 'audio-transition.zip') -Force
+    return @{ Bytes = $bytes; Version = $version; IsTested = ($sha -eq $AudioTransition.Tested.Sha256) }
+}
+
+# The latest release (or the tested one with -Tested); falls back to the tested
+# one, and returns $null if neither can be downloaded.
+function Resolve-AudioTransition {
+    if (-not $script:Tested) {
+        try { return Get-AudioTransitionRelease $false }
+        catch { Write-Note "$($AudioTransition.Name): could not get the latest version ($($_.Exception.Message)). Trying the last tested version, $($AudioTransition.Tested.Version)." }
+    }
+    try { return Get-AudioTransitionRelease $true }
+    catch { Write-Note "$($AudioTransition.Name): could not get the tested version either ($($_.Exception.Message))." }
+    return $null
+}
+
 # --- Download-only mode -----------------------------------------------------
 if ($DownloadOnly) {
-    Write-Step "Downloading pinned installers into $InstallerDir"
-    foreach ($d in $Dependencies + $Python) { Save-Installer $d | Out-Null }
+    $which = if ($Tested) { 'last tested' } else { 'latest' }
+    Write-Step "Downloading the $which installers into $InstallerDir"
+    $obsMajor = ''
+    foreach ($d in $Dependencies) {
+        $target = Resolve-Target $d $obsMajor
+        if ($d.Name -eq 'OBS Studio') { $obsMajor = ($target.Version -split '\.')[0] }
+        if ($target.Version -ne $d.Tested.Version) { Write-Note "$($d.Name) $($target.Version): WARNING: not tested with this setup yet (last tested: $($d.Tested.Version))." }
+        Save-Installer $d $target | Out-Null
+    }
+    Save-Installer $Python ($Python.Tested + @{ Latest = $false }) | Out-Null
+    $at = Get-AudioTransitionRelease $Tested.IsPresent
+    $atNote = if ($at.IsTested) { 'tested' } else { "WARNING: not tested with this setup yet (last tested: $($AudioTransition.Tested.Version))" }
+    Write-Ok "$($AudioTransition.Name) $($at.Version): downloaded ($atNote)."
     Write-Host ''
     Write-Host 'Done. Nothing was installed.' -ForegroundColor Cyan
     exit 0
@@ -289,10 +574,10 @@ if (Get-Process -Name obs64, obs32 -ErrorAction SilentlyContinue) {
     throw 'OBS is running. Close OBS and run this again.'
 }
 
-# --- Elevated run: install missing dependencies only ------------------------
+# --- Elevated run: install dependencies only --------------------------------
 if ($DependenciesOnly) {
-    Write-Step 'Installing missing OBS, VLC and plugins (admin)'
-    foreach ($d in @(Get-MissingDependency $true)) { Install-Dependency $d }
+    Write-Step 'Installing OBS, VLC and plugins (admin)'
+    foreach ($item in @(Get-DependencyPlan $false)) { Install-Dependency $item }
     Write-Host ''
     Write-Host 'Done. This window closes in 5 seconds.' -ForegroundColor Cyan
     Start-Sleep -Seconds 5
@@ -327,13 +612,15 @@ Write-Step 'OBS, VLC and plugins'
 if ($SkipDependencies) {
     Write-Note 'Skipped (-SkipDependencies).'
 } else {
-    $missing = @(Get-MissingDependency $false)
-    if ($missing.Count -gt 0) {
+    $plan = @(Get-DependencyPlan $false)
+    if ($plan.Count -gt 0) {
         if (Test-Admin) {
-            foreach ($d in $missing) { Install-Dependency $d }
+            foreach ($item in $plan) { Install-Dependency $item }
         } else {
-            Write-Host "    Installing $($missing.Count) program(s) needs admin rights. Windows will ask for permission..."
+            Write-Host "    Installing $($plan.Count) program(s) needs admin rights. Windows will ask for permission..."
             $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DependenciesOnly"
+            if ($Upgrade) { $argList += ' -Upgrade' }
+            if ($Tested)  { $argList += ' -Tested' }
             try {
                 $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -Wait -PassThru
             } catch {
@@ -341,9 +628,9 @@ if ($SkipDependencies) {
             }
             if ($p.ExitCode -ne 0) { throw "Installing the dependencies failed (exit code $($p.ExitCode)). See the admin window's message." }
         }
-        $still = @(Get-MissingDependency $true)
-        if ($still.Count -gt 0) { throw "Still not installed after running the installers: $(($still | ForEach-Object { $_.Name }) -join ', ')" }
-        Write-Ok 'All dependencies installed.'
+        $still = @(Get-DependencyPlan $true)
+        if ($still.Count -gt 0) { throw "Not installed as expected after running the installers: $(($still | ForEach-Object { $_.Dep.Name }) -join ', ')" }
+        Write-Ok 'OBS, VLC and plugins are in place.'
     }
 }
 
@@ -402,6 +689,32 @@ Install-TextFile -Path $sceneDest -Content $scene -Encoding $Utf8NoBom -Overwrit
 $scripts = [regex]::Matches($scene, '"path"\s*:\s*"([^"]+\.lua)"') | ForEach-Object { $_.Groups[1].Value }
 foreach ($s in $scripts) { Write-Ok "Script registered: $s" }
 
+# Audio Transition script: not part of this repo, downloaded from the OBS forum.
+$atLocal        = if (Test-Path -LiteralPath $AudioTransitionDest) { Read-Text $AudioTransitionDest } else { $null }
+$atLocalVersion = if ($atLocal) { Get-AudioTransitionVersion $atLocal } else { $null }
+$atRelease      = Resolve-AudioTransition
+if (-not $atRelease) {
+    if ($atLocal) { Write-Note "$($AudioTransition.Name) $atLocalVersion kept as is (could not check for a newer version)." }
+    else { Write-Note "$($AudioTransition.Name) is missing: download it from $($AudioTransition.Page) and save audio-transition.lua in Scripts\." }
+} else {
+    $atKind = if ($Tested) { 'tested' } else { 'latest' }
+    $atWarn = if (-not $atRelease.IsTested) { " WARNING: not tested with this setup yet (last tested: $($AudioTransition.Tested.Version))." } else { '' }
+    if (-not $atLocal) {
+        [IO.File]::WriteAllBytes($AudioTransitionDest, $atRelease.Bytes)
+        Write-Ok "$($AudioTransition.Name) $($atRelease.Version) ($atKind) downloaded into Scripts\.$atWarn"
+    } elseif ((Compare-Version $atLocalVersion $atRelease.Version) -lt 0) {
+        if ($Upgrade) {
+            Copy-Item -LiteralPath $AudioTransitionDest -Destination "$AudioTransitionDest.before-install-$Stamp"
+            [IO.File]::WriteAllBytes($AudioTransitionDest, $atRelease.Bytes)
+            Write-Note "$($AudioTransition.Name) upgraded from $atLocalVersion to $($atRelease.Version) ($atKind); the old file was backed up.$atWarn"
+        } else {
+            Write-Note "$($AudioTransition.Name) $atLocalVersion present. Newer $atKind version $($atRelease.Version) is available. Run install.bat -Upgrade to install it."
+        }
+    } else {
+        Write-Ok "$($AudioTransition.Name) $atLocalVersion present."
+    }
+}
+
 # --- 4. Make it the active scene collection ---------------------------------
 Write-Step 'Active scene collection'
 
@@ -453,6 +766,8 @@ if ($SkipFont) {
                   (Test-Path -LiteralPath (Join-Path $userFonts $fontName))
     if ($installed) {
         Write-Ok "$fontName already installed."
+    } elseif (-not (Test-Path -LiteralPath $FontSrc)) {
+        Write-Note "$fontName is not installed and not in Fonts\ (it isn't part of this repo). The title and end-text overlays will use a substitute font until you install it: see 'Recommended font' in README.md."
     } else {
         if (-not (Test-Path -LiteralPath $userFonts)) { New-Item -ItemType Directory -Path $userFonts -Force | Out-Null }
         $fontDest = Join-Path $userFonts $fontName
@@ -473,39 +788,43 @@ if ($SkipTickers) {
 } else {
     $tickersVenv = Join-Path $TickersDir '.venv\Scripts\python.exe'
     $tickersRel  = $TickersDir.Substring($RepoRoot.Length + 1)
+    $requirementsChanged = $false
 
-    # Clone, unless a tickers folder is already there (never touch a working copy).
+    # Clone the latest main, or bring an existing clone up to date when that's safe.
     if (Test-Path -LiteralPath $TickersDir) {
-        $describe = if (Test-Path -LiteralPath (Join-Path $TickersDir '.git')) {
-            $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-            try { (& git -C $TickersDir describe --tags --always --dirty 2>$null) } finally { $ErrorActionPreference = $prev }
-        } else { 'not a git repo' }
-        Write-Ok "$tickersRel already present ($describe). Left as is."
+        if (-not (Test-Path -LiteralPath (Join-Path $TickersDir '.git'))) {
+            Write-Note "$tickersRel is not a git clone. Not updated."
+        } elseif (-not $haveGit) {
+            Write-Note 'git not found. The tickers were not checked for updates.'
+        } else {
+            $requirementsChanged = Update-TickersClone $tickersRel
+        }
     } else {
         if (-not $haveGit) { throw 'git is needed to download the live tickers. Install Git for Windows, or use -SkipTickers.' }
-        Write-Host "    Cloning $TickersUrl at $TickersTag..."
-        Invoke-Git -c advice.detachedHead=false clone --quiet --branch $TickersTag $TickersUrl $tickersRel | Out-Null
+        Write-Host "    Cloning the latest $TickersBranch of $TickersUrl..."
+        Invoke-Git clone --quiet --branch $TickersBranch $TickersUrl $tickersRel | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $TickersDir 'setup.bat'))) {
             throw "Could not clone the live tickers from $TickersUrl (exit code $LASTEXITCODE)."
         }
-        Write-Ok "Cloned into $tickersRel at $TickersTag."
+        Write-Ok "Cloned into $tickersRel ($(Invoke-GitIn $TickersDir describe --tags --always))."
     }
 
-    # Virtual environment, via the tickers' own setup.bat, unless it already exists.
-    if (Test-Path -LiteralPath $tickersVenv) {
+    # Virtual environment via the tickers' own setup.bat: when it's missing, or
+    # when requirements.txt changed in the update (setup.bat reuses .venv then).
+    if ((Test-Path -LiteralPath $tickersVenv) -and -not $requirementsChanged) {
         Write-Ok 'Python environment already set up.'
     } else {
         $py = Find-Python $Python.Minor
         if (-not $py) {
-            Write-Host "    Python $($Python.Version) not found, installing it for the current user..."
-            $file = Save-Installer $Python
+            Write-Host "    Python $($Python.Tested.Version) not found, installing it for the current user..."
+            $file = Save-Installer $Python ($Python.Tested + @{ Latest = $false })
             $p = Start-Process -FilePath $file -ArgumentList $Python.Args -Wait -PassThru
             if ($p.ExitCode -ne 0) { throw "Python installer failed (exit code $($p.ExitCode))." }
             $py = Find-Python $Python.Minor
-            if (-not $py) { throw "Python $($Python.Version) was installed but could not be found." }
+            if (-not $py) { throw "Python $($Python.Tested.Version) was installed but could not be found." }
             Write-Ok "Python $($py.Version) installed."
-        } elseif ($py.Version -ne $Python.Version) {
-            Write-Note "Using Python $($py.Version) (this repo pins $($Python.Version))."
+        } elseif ($py.Version -ne $Python.Tested.Version) {
+            Write-Note "Using Python $($py.Version) (this repo pins $($Python.Tested.Version))."
         } else {
             Write-Ok "Python $($py.Version) found."
         }
@@ -513,7 +832,8 @@ if ($SkipTickers) {
         # Put this Python first on PATH for setup.bat. The empty input answers its
         # final 'pause'. '.\' because some PCs block running files from the current
         # folder by bare name (NoDefaultCurrentDirectoryInExePath).
-        Write-Host '    Running the tickers'' setup.bat (creates .venv, installs packages)...'
+        $why = if ($requirementsChanged) { 'requirements.txt changed, updating packages' } else { 'creates .venv, installs packages' }
+        Write-Host "    Running the tickers' setup.bat ($why)..."
         $pyDir = Split-Path $py.Exe -Parent
         $previousPath = $env:Path
         $env:Path = "$pyDir;$pyDir\Scripts;$env:Path"
@@ -524,7 +844,7 @@ if ($SkipTickers) {
 
         # setup.bat always exits 0, so the import check below is what decides.
         if (-not (Test-Path -LiteralPath $tickersVenv)) { throw 'setup.bat did not create the .venv folder.' }
-        Write-Ok 'Python environment created.'
+        Write-Ok 'Python environment ready.'
     }
 
     # Health check, also for an existing environment. (No double quotes in the

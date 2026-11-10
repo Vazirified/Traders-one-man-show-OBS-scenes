@@ -14,6 +14,13 @@ VazirifiedFX-dual-output-scene/resources/live-session-music/
 *.mp3
 *.wav
 
+# Third-party files the installer handles instead (see README):
+# Audio Transition script by dqm, downloaded from the OBS forum (no license to share it),
+# and the IRZar font, a recommended install.
+Scripts/audio-transition.lua
+Scripts/audio-transition.lua.before-install-*
+Fonts/IRZar.ttf
+
 # OBS auto-backups (git history replaces them)
 *.bak
 

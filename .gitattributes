@@ -13,6 +13,11 @@
 *.json text eol=lf
 *.lua  text eol=lf
 
+# Installer: shell script for git's sh needs LF; Windows scripts keep CRLF.
+*.sh   text eol=lf
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+
 # VDO.Ninja stream IDs are swapped for __VDO_NINJA_STREAM_ID__ on commit and
 # restored on checkout. The real ID lives only in local .git/config (see README).
 *.json filter=vdoninja
